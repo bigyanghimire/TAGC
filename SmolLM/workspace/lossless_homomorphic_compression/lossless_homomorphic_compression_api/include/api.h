@@ -1,0 +1,14 @@
+void launch_create_index_4_bit(float* data, char* index, int grid_size, int block_size, unsigned long long* counter, long stream);
+void launch_create_index_4_bit_bf16(__nv_bfloat16* data, char* index, int grid_size, int block_size, unsigned long long* counter, long stream);
+void launch_read_index_4_bit(int* data, char* index, int grid_size, int block_size, long stream);
+void launch_read_index_4_bit_bf16(short* data, char* index, int grid_size, int block_size, long stream);
+void launch_create_index_1_bit(float* data, char* index, int grid_size, int block_size, unsigned long long* counter, long stream);
+void launch_create_index_1_bit_bf16(__nv_bfloat16* data, char* index, int grid_size, int block_size, unsigned long long* counter, long stream);
+void launch_read_index_1_bit(int* data, char* index, int grid_size, int block_size, long stream);
+void launch_read_index_1_bit_bf16(short* data, char* index, int grid_size, int block_size, long stream);
+void launch_compress_float_32(float* data, float* count_sketch, int* count_mapping, int compressed_r, int grid_size, int block_size, long stream);
+void launch_compress_bfloat_16(__nv_bfloat16* data, __nv_bfloat16* count_sketch, int* count_mapping, int compressed_r, int grid_size, int block_size, long stream);
+void launch_decompress_float_32(float* data, float* count_sketch, int* count_mapping, int compressed_r, int grid_size, int block_size, int* flag, long stream);
+void launch_decompress_bfloat_16(__nv_bfloat16* data, __nv_bfloat16* count_sketch, int* count_mapping, int compressed_r, int grid_size, int block_size, int* flag, long stream);
+void launch_estimate_float_32(float* data, float* count_sketch, int compressed_r, int grid_size, int block_size, unsigned long long* counter, long stream);
+void launch_estimate_bfloat_16(__nv_bfloat16* data, __nv_bfloat16* count_sketch, int compressed_r, int grid_size, int block_size, unsigned long long* counter, long stream);

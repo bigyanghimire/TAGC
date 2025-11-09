@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Khrushchev"
+  given-names: "Mikhail"
+- family-names: "Frolov"
+  given-names: "Anton"
+- family-names: "Vasilev"
+  given-names: "Ruslan"
+title: "YaFSDP: Yet another Fully Sharded Data Parallel"
+date-released: 2024-06-11
+url: "https://github.com/yandex/YaFSDP"

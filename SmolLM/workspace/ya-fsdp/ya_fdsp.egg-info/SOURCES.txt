@@ -1,0 +1,10 @@
+LICENSE
+README.md
+pyproject.toml
+ya_fdsp.egg-info/PKG-INFO
+ya_fdsp.egg-info/SOURCES.txt
+ya_fdsp.egg-info/dependency_links.txt
+ya_fdsp.egg-info/top_level.txt
+ya_fsdp/__init__.py
+ya_fsdp/meta_param.py
+ya_fsdp/ya_fsdp.py

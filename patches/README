@@ -1,0 +1,5 @@
+The patch is for torch 2.4.1
+
+To apply it please run the following commands:
+git clone -b v2.4.1 --depth 1 https://github.com/pytorch/pytorch.git && git apply --directory pytorch torch.diff
+pip install --no-cache-dir ./pytorch

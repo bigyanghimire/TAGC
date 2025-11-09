@@ -25,8 +25,12 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+import torch.distributed
+import torch.distributed.checkpoint as dist_cp
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy, BackwardPrefetch
+from torch.distributed.checkpoint.optimizer import load_sharded_optimizer_state_dict
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 from torch.distributed.distributed_c10d import _get_default_group
@@ -34,9 +38,13 @@ from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.distributed.algorithms._comm_hooks import default_hooks
 from torch.distributed.fsdp._common_utils import _get_module_fsdp_state
 
+
+from metrics_custom import Metrics
 from model import GPTConfig, GPT
 
-from tagc import HomomorphicCompressState, homomorphic_compress_hook, fp32_compress_hook, transformer_compress_hook, IndexSize, TAGCState
+from tagc import transformer_compress_hook, IndexSize, TAGCState
+
+import wandb
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -46,8 +54,11 @@ eval_interval = 20
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+always_save_checkpoint = False # if True, always save a checkpoint after each eval
+checkpoint_interval = 20
+#init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'scratch' if not os.path.exists(os.path.join(out_dir, 'ckpt.pt'))  else 'resume'  # 'scratch' or 'resume' or 'gpt2*'
+
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -155,9 +166,18 @@ if os.path.exists(meta_path):
     meta_vocab_size = meta['vocab_size']
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
+COMPRESS_ALL_LAYERS = False
+
+def custom_wrap_policy(module: torch.nn.Module, recurse: bool, nonwrapped_numel: int) -> bool:
+    if not recurse:
+        return isinstance(module, torch.nn.Embedding) or isinstance(module, torch.nn.Linear)
+    return nonwrapped_numel > (100000 if COMPRESS_ALL_LAYERS else 2000000)
+
+
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+just_resumed = False
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -167,29 +187,60 @@ if init_from == 'scratch':
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
+    if ddp:
+        internal_model = model
+        model = FSDP(model
+                    , use_orig_params=True
+                    , auto_wrap_policy=custom_wrap_policy
+                )
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
+    print(f"Sleeping for timeout to ensure all NCCL ops of previous call are finished")
+    time.sleep(60 + 5)
+
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
-    checkpoint_model_args = checkpoint['model_args']
-    # force these config attributes to be equal otherwise we can't even resume training
-    # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-        model_args[k] = checkpoint_model_args[k]
+    state_dict = torch.load(ckpt_path)
     # create the model
+    model_args = state_dict['model_args']
+    iter_num = state_dict['iter_num']
+    print(f"Iteration number {iter_num}")
+    best_val_loss = state_dict['best_val_loss']
+    wandb_run_id = state_dict['wandb_run_id'] if 'wandb_run_id' in state_dict else None
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
-    state_dict = checkpoint['model']
-    # fix the keys of the state dictionary :(
-    # honestly no idea how checkpoints sometimes get this prefix, have to debug more
-    unwanted_prefix = '_orig_mod.'
-    for k,v in list(state_dict.items()):
-        if k.startswith(unwanted_prefix):
-            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-    model.load_state_dict(state_dict)
-    iter_num = checkpoint['iter_num']
-    best_val_loss = checkpoint['best_val_loss']
+    model.to(device)
+    internal_model = model
+    fsdp = FSDP(model
+                , use_orig_params=True
+                , auto_wrap_policy=custom_wrap_policy
+            )
+    # Load checkpoint only on rank 0 to avoid memory redundancy
+    cfg = torch.distributed.fsdp.FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(fsdp, StateDictType.FULL_STATE_DICT, cfg):
+        state = fsdp.state_dict()
+
+    gptconf = GPTConfig(**model_args)
+    model = GPT(gptconf)
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    full_osd = dict()
+    if master_process:
+        model.load_state_dict(state_dict['model'])
+        full_osd = state_dict['optimizer']
+    internal_model = model
+    model = FSDP(model
+                , use_orig_params=True
+                , auto_wrap_policy=custom_wrap_policy
+                , device_id = torch.cuda.current_device()
+                , sync_module_states=True
+            )
+    sharded_osd = FSDP.scatter_full_optim_state_dict(full_osd, model)
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+    optimizer.load_state_dict(sharded_osd)
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config, resume='allow', id=wandb_run_id,
+               settings=wandb.Settings(mode='shared', x_primary=master_process))
+
+    just_resumed = True
 elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
@@ -198,19 +249,20 @@ elif init_from.startswith('gpt2'):
     # read off the created config params, so we can store them into checkpoint correctly
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
-# crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # so that the checkpoint will have the right value
-model.to(device)
+
+if init_from != 'resume':
+    # crop down the model block size if desired, using model surgery
+    if block_size < model.config.block_size:
+        model.crop_block_size(block_size)
+        model_args['block_size'] = block_size # so that the checkpoint will have the right value
+    model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
-if init_from == 'resume':
-    optimizer.load_state_dict(checkpoint['optimizer'])
+if init_from != 'resume':
+    optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 checkpoint = None # free up memory
 
 # compile the model
@@ -219,32 +271,19 @@ if compile:
     unoptimized_model = model
     model = torch.compile(model) # requires PyTorch 2.0
 
-COMPRESS_ALL_LAYERS = False
-
-def custom_wrap_policy(module: torch.nn.Module, recurse: bool, nonwrapped_numel: int) -> bool:
-    if not recurse:
-        return isinstance(module, torch.nn.Embedding) or isinstance(module, torch.nn.Linear)
-    return nonwrapped_numel > (100000 if COMPRESS_ALL_LAYERS else 2000000)
-
-if ddp:
-    print("Enable FSDP")
-    internal_model = model
-    model = FSDP(model
-                , use_orig_params=True
-                , auto_wrap_policy=custom_wrap_policy
-            )
-    print(model)
-    is_transformer_hook = (lambda numel: numel != 2359296 and numel != 38633472
-                           and (not COMPRESS_ALL_LAYERS
-                           or numel != 1769472 and numel != 589824 and numel != 393216))
-    state = TAGCState(process_group=_get_default_group(),
-                     num_processes=ddp_world_size,
-                     process_index=ddp_rank,
-                     sparsify_fraction=0.80,
-                     index_size=IndexSize.ONE_BIT,
-                     compress_ratio=2,
-                     is_transformer_hook=is_transformer_hook)
-    model.register_comm_hook(state, transformer_compress_hook)
+print(model)
+is_transformer_hook = (lambda numel: numel != 2359296 and numel != 38633472
+                        and (not COMPRESS_ALL_LAYERS
+                        or numel != 1769472 and numel != 589824 and numel != 393216))
+state = TAGCState(process_group=_get_default_group(),
+                    num_processes=ddp_world_size,
+                    process_index=ddp_rank,
+                    sparsify_fraction=0.9875,
+                    index_size=IndexSize.FOUR_BITS,
+                    compress_ratio=10,
+                    device=device,
+                    is_transformer_hook=is_transformer_hook)
+model.register_comm_hook(state, transformer_compress_hook)
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -276,10 +315,21 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+
 # logging
-if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+if init_from != 'resume':
+    if master_process:
+        wandb.init(project=wandb_project, name=wandb_run_name, config=config,
+                   settings=wandb.Settings(mode='shared', x_primary=master_process))
+        print(f'wandb.run.id {wandb.run.id}')
+        torch.distributed.broadcast_object_list([wandb.run.id], 0)
+    else:
+        wandb_run_id_list = [None]
+        torch.distributed.broadcast_object_list(wandb_run_id_list, 0)
+        print(f'wandb.run.id {wandb_run_id_list[0]}')
+
+        wandb.init(project=wandb_project, name=wandb_run_name, config=config, id=wandb_run_id_list[0],
+                   settings=wandb.Settings(mode='shared', x_primary=master_process))
 
 
 def trace_handler(prof):
@@ -288,10 +338,30 @@ def trace_handler(prof):
         f"{out_dir}/trace_{ddp_local_rank}_{prof.step_num}.json"
     )
 
+
+last_tick = None
+def timer_tick(message: str='', detail=False):
+    global last_tick
+#    return # Turn off extra logging
+    current_time = time.time_ns()
+    if last_tick is not None:
+        if not detail:
+            print(message + f' timer tick {(current_time - last_tick) / 1_000_000}')
+    last_tick = time.time_ns()
+timer_tick()
+
+
+metrics = Metrics(ddp_world_size)
+
+print(f'total counter before start {state.total_counter}')
+print(f'nonzero counter before start {state.nonzero_counter.cpu().item() // ddp_world_size}')
+print(f'estimate counter before start {state.estimate_counter.cpu().item()}')
+
 # training loop
 with torch.profiler.profile(
     activities=[torch.profiler.ProfilerActivity.CUDA],
-    schedule=torch.profiler.schedule(wait=10, warmup=10, active=1, repeat=0),
+    schedule=torch.profiler.schedule(wait=190, warmup=9, active=1, repeat=0),
+#    schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=0),
     on_trace_ready=trace_handler,
 ) as prof:
     X, Y = get_batch('train') # fetch the very first batch
@@ -299,8 +369,9 @@ with torch.profiler.profile(
     val_time = 0
     local_iter_num = 0 # number of iterations in the lifetime of this process
     raw_model = model.module if ddp else model # unwrap DDP container if needed
-    running_mfu = -1.0
+    running_mfu = -.01
     while True:
+        timer_tick('Before get_lr')
 
         # determine and set the learning rate for this iteration
         lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -309,7 +380,8 @@ with torch.profiler.profile(
 
         # evaluate the loss on train/val sets and write checkpoints
     #    if iter_num % eval_interval == 0 and master_process:
-        if iter_num % eval_interval == 0: # and master_process works for DDP, for FSDP we should compute val on all ranks
+        if not just_resumed and (iter_num % eval_interval == 0): # and master_process works for DDP, for FSDP we should compute val on all ranks
+            timer_tick('Before eval')
             val_t0 = time.time()
             losses = estimate_loss()
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
@@ -321,44 +393,58 @@ with torch.profiler.profile(
                     "lr": lr,
                     "mfu": running_mfu*100, # convert to percentage
                 })
-            if losses['val'] < best_val_loss or always_save_checkpoint:
+            if always_save_checkpoint or (iter_num % checkpoint_interval == 0):
                 best_val_loss = losses['val']
                 if iter_num > 0:
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': model_args,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                        'config': config,
-                    }
-                    print(f"saving checkpoint to {out_dir}")
-                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT):
+                        checkpoint = {
+                            'model': model.state_dict(),
+                            'optimizer': FSDP.optim_state_dict(model, optimizer),
+                            'model_args': model_args,
+                            'iter_num': iter_num,
+                            'best_val_loss': best_val_loss,
+                            'config': config,
+                        }
+                        if wandb_log:
+                            checkpoint['wandb_run_id'] = wandb.run.id
+                        print(f"saving checkpoint to {out_dir}")
+                        torch.save(checkpoint,os.path.join(out_dir, 'ckpt.pt'))
             val_t1 = time.time()
             val_time += val_t1 - val_t0
+            timer_tick('After eval')
         if iter_num == 0 and eval_only:
             break
 
         # forward backward update, with optional gradient accumulation to simulate larger batch size
         # and using the GradScaler if data type is float16
         for micro_step in range(gradient_accumulation_steps):
-            if ddp:
-                # in DDP training we only need to sync gradients at the last micro step.
-                # the official way to do this is with model.no_sync() context manager, but
-                # I really dislike that this bloats the code and forces us to repeat code
-                # looking at the source of that context manager, it just toggles this variable
-                model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+            timer_tick('Before step', detail=True)
+            # in DDP training we only need to sync gradients at the last micro step.
+            if micro_step != gradient_accumulation_steps - 1:
+                no_sync_ctx = model.no_sync()
+                no_sync_ctx.__enter__()
+            else:
+                no_sync_ctx = None
             with ctx:
+                timer_tick('Before model', detail=True)
                 logits, loss = model(X, Y)
+                timer_tick('After model')
                 loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
             # immediately async prefetch next batch while model is doing the forward pass on the GPU
             X, Y = get_batch('train')
+            timer_tick('After get_batch')
             # backward pass, with gradient scaling if training in fp16
             scaler.scale(loss).backward()
+            timer_tick('after backward')
             if ddp:
                 state.end_iteration()
+            timer_tick('after end iteration', detail=True)
             prof.step()
+            timer_tick('After step')
+            if no_sync_ctx is not None:
+                no_sync_ctx.__exit__(None, None, None)
         # clip the gradient
+        timer_tick('Before tail', detail=True)
         if grad_clip != 0.0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -373,7 +459,9 @@ with torch.profiler.profile(
         dt = t1 - t0 - val_time
         t0 = t1
         val_time = 0
+        timer_tick('After tail')
         if iter_num % log_interval == 0 and master_process:
+            timer_tick('Before log', detail=True)
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
             lossf = loss.item() * gradient_accumulation_steps
@@ -381,14 +469,16 @@ with torch.profiler.profile(
                 mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
-            print(f'Unshard stream: {_get_module_fsdp_state(model)._unshard_stream.stream_id}')
-            print(f'Default stream: {_get_module_fsdp_state(model)._default_stream.stream_id}')
+            metrics.print(state)
+            timer_tick('After log')
         iter_num += 1
         local_iter_num += 1
+        just_resumed =False
 
         # termination conditions
         if iter_num > max_iters:
             break
+
 
     if ddp:
         destroy_process_group()

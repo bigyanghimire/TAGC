@@ -1,0 +1,15 @@
+InfiniBand setup
+
+For the Mellanox MCX456A-ECAT (2x QSFP28 100GBE):
+- put the card to the motherboard
+- put the InfiniBand cables to the port until they click
+- install https://network.nvidia.com/products/infiniband-drivers/linux/mlnx_ofed/
+- follow https://enterprise-support.nvidia.com/s/article/getting-started-with-connectx-4-100gb-s-adapter-for-linux
+- put ifconfig ip and mtu configuration to .bashrc
+  (under "if ! ip link | grep enp10s0f0np0 | grep "state UP"; then" to keep mc work and avoid too many sudo password requests)
+- configure IP addr/mask settings in ubuntu GUI
+- seemingly at lease one of the two hosts should have opensm installed: https://access.redhat.com/articles/7087953
+- check the connection using "ibstat"
+- check the TCP using ping ubuntu GUI
+- see the PCIe speed for the card: "sudo dmesg | grep mlx"
+
