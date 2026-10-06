@@ -1,0 +1,11 @@
+setuptools
+wheel
+ninja
+packaging
+numpy<2
+transformers<5
+# OpenWebText preparation uses a dataset script, supported by datasets 2.x.
+datasets>=2.21,<3
+tiktoken
+wandb
+tqdm
