@@ -50,4 +50,4 @@ srun --export=ALL --ntasks="$NUM_NODES" --ntasks-per-node=1 -l bash -c '
     --rdzv_id "$SLURM_JOB_ID" \
     --rdzv_backend c10d \
     --rdzv_endpoint "$MASTER_ADDR:$MASTER_PORT" \
-    train.py config/train_gpt2.py > "${LOG_DIR}/exp.log" 2>&1
+    train.py config/train_gpt2.py --profile=False > "${LOG_DIR}/exp.log" 2>&1

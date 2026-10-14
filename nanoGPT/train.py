@@ -46,7 +46,7 @@ eval_interval = 20
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
-always_save_checkpoint = True # if True, always save a checkpoint after each eval
+always_save_checkpoint = False # if True, always save a checkpoint after each eval
 init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
@@ -84,6 +84,7 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps'
 dtype = 'float32'
 #compile = True # use PyTorch 2.0 to compile the model to be faster
 compile = False # use PyTorch 2.0 to compile the model to be faster
+profile = False # enable the PyTorch CUDA profiler and trace export
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -289,14 +290,16 @@ def trace_handler(prof):
     )
 
 # training loop
-with torch.profiler.profile(
-    activities=[torch.profiler.ProfilerActivity.CUDA],
-    schedule=torch.profiler.schedule(wait=10, warmup=10, active=1, repeat=0),
-    on_trace_ready=trace_handler,
-) as prof:
+profiler_context = nullcontext()
+if profile:
+    profiler_context = torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA],
+        schedule=torch.profiler.schedule(wait=10, warmup=10, active=1, repeat=0),
+        on_trace_ready=trace_handler,
+    )
+with profiler_context as prof:
     X, Y = get_batch('train') # fetch the very first batch
-    t0 = time.time()
-    val_time = 0
+    total_training_time = 0.0
     local_iter_num = 0 # number of iterations in the lifetime of this process
     raw_model = model.module if ddp else model # unwrap DDP container if needed
     running_mfu = -1.0
@@ -310,7 +313,6 @@ with torch.profiler.profile(
         # evaluate the loss on train/val sets and write checkpoints
     #    if iter_num % eval_interval == 0 and master_process:
         if iter_num % eval_interval == 0: # and master_process works for DDP, for FSDP we should compute val on all ranks
-            val_t0 = time.time()
             losses = estimate_loss()
             print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
             if wandb_log and master_process:
@@ -332,12 +334,15 @@ with torch.profiler.profile(
                         'best_val_loss': best_val_loss,
                         'config': config,
                     }
-                    print(f"saving checkpoint to {out_dir}")
-                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-            val_t1 = time.time()
-            val_time += val_t1 - val_t0
+                    # print(f"saving checkpoint to {out_dir}")
+                    # torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
         if iter_num == 0 and eval_only:
             break
+
+        # Time one optimizer update, including all accumulated microbatches.
+        if device_type == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.time()
 
         # forward backward update, with optional gradient accumulation to simulate larger batch size
         # and using the GradScaler if data type is float16
@@ -357,7 +362,8 @@ with torch.profiler.profile(
             scaler.scale(loss).backward()
             if ddp:
                 state.end_iteration()
-            prof.step()
+            if prof is not None:
+                prof.step()
         # clip the gradient
         if grad_clip != 0.0:
             scaler.unscale_(optimizer)
@@ -369,10 +375,10 @@ with torch.profiler.profile(
         optimizer.zero_grad(set_to_none=True)
 
         # timing and logging
-        t1 = time.time()
-        dt = t1 - t0 - val_time
-        t0 = t1
-        val_time = 0
+        if device_type == 'cuda':
+            torch.cuda.synchronize()
+        dt = time.time() - t0
+        total_training_time += dt
         if iter_num % log_interval == 0 and master_process:
             # get loss as float. note: this is a CPU-GPU sync point
             # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
@@ -380,15 +386,20 @@ with torch.profiler.profile(
             if local_iter_num >= 5: # let the training loop settle a bit
                 mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
                 running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, "
+                  f"Throughput (global): {tokens_per_iter / dt:,.0f} tokens/s, mfu {running_mfu*100:.2f}%")
             print(f'Unshard stream: {_get_module_fsdp_state(model)._unshard_stream.stream_id}')
             print(f'Default stream: {_get_module_fsdp_state(model)._default_stream.stream_id}')
         iter_num += 1
         local_iter_num += 1
 
         # termination conditions
-        if iter_num > max_iters:
+        if iter_num >= max_iters:
             break
+
+    if master_process and local_iter_num > 0:
+        print(f"Final Average Step Time: {total_training_time / local_iter_num:.4f} seconds | "
+              f"Throughput (global): {local_iter_num * tokens_per_iter / total_training_time:,.0f} tokens/s")
 
     if ddp:
         destroy_process_group()

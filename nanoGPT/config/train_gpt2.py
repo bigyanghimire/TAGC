@@ -13,7 +13,7 @@ block_size = 512
 gradient_accumulation_steps = 5 * 8
 
 # this makes total number of tokens be 300B
-max_iters = 600000
+max_iters = 100
 lr_decay_iters = 600000
 
 # eval stuff
