@@ -32,8 +32,9 @@ apptainer exec --userns --cleanenv --nv \
         python -m pip install -r requirements.txt
 
         TORCH_SITE=$(python -c "import sysconfig; print(sysconfig.get_path(\"purelib\"))")
-        if ! git apply --reverse --check --unsafe-paths --directory "$TORCH_SITE" patches/torch.diff 2>/dev/null; then
-            git apply --unsafe-paths --directory "$TORCH_SITE" patches/torch.diff
+        # Run outside the submodule: its parent Git metadata is not mounted here.
+        if ! git -C /tmp apply --reverse --check --unsafe-paths --directory "$TORCH_SITE" /workspace/TAGC/patches/torch.diff 2>/dev/null; then
+            git -C /tmp apply --unsafe-paths --directory "$TORCH_SITE" /workspace/TAGC/patches/torch.diff
         fi
 
         python -m pip install --no-build-isolation ./lossless_homomorphic_compression/lossless_homomorphic_compression_api

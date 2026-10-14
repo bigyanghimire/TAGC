@@ -3,6 +3,8 @@ wheel
 ninja
 packaging
 numpy<2
+# Keep PyArrow compatible with the NumPy 1.x pin.
+pyarrow==17.0.0
 transformers<5
 # OpenWebText preparation uses a dataset script, supported by datasets 2.x.
 datasets>=2.21,<3
