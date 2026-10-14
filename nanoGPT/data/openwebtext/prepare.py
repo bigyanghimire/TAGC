@@ -2,8 +2,6 @@
 # https://github.com/HazyResearch/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
 
 import os
-LOCAL_DIR = os.path.abspath("/share/bigyang/local")
-os.environ["HF_HOME"] = LOCAL_DIR
 from tqdm import tqdm
 import numpy as np
 import tiktoken
