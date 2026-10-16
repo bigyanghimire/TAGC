@@ -241,7 +241,7 @@ if ddp:
     state = TAGCState(process_group=_get_default_group(),
                      num_processes=ddp_world_size,
                      process_index=ddp_rank,
-                     sparsify_fraction=0.80,
+                     sparsify_fraction=0.99,
                      index_size=IndexSize.ONE_BIT,
                      compress_ratio=2,
                      is_transformer_hook=is_transformer_hook)
