@@ -241,7 +241,7 @@ if ddp:
     state = TAGCState(process_group=_get_default_group(),
                      num_processes=ddp_world_size,
                      process_index=ddp_rank,
-                     sparsify_fraction=0.99,
+                     sparsify_fraction=0.5,
                      index_size=IndexSize.ONE_BIT,
                      compress_ratio=2,
                      is_transformer_hook=is_transformer_hook)
@@ -323,19 +323,19 @@ with profiler_context as prof:
                     "lr": lr,
                     "mfu": running_mfu*100, # convert to percentage
                 })
-            if losses['val'] < best_val_loss or always_save_checkpoint:
-                best_val_loss = losses['val']
-                if iter_num > 0:
-                    checkpoint = {
-                        'model': raw_model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'model_args': model_args,
-                        'iter_num': iter_num,
-                        'best_val_loss': best_val_loss,
-                        'config': config,
-                    }
-                    # print(f"saving checkpoint to {out_dir}")
-                    # torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+            # if losses['val'] < best_val_loss or always_save_checkpoint:
+            #     best_val_loss = losses['val']
+            #     if iter_num > 0:
+            #         checkpoint = {
+            #             'model': raw_model.state_dict(),
+            #             'optimizer': optimizer.state_dict(),
+            #             'model_args': model_args,
+            #             'iter_num': iter_num,
+            #             'best_val_loss': best_val_loss,
+            #             'config': config,
+            #         }
+            #         # print(f"saving checkpoint to {out_dir}")
+            #         # torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
         if iter_num == 0 and eval_only:
             break
 
